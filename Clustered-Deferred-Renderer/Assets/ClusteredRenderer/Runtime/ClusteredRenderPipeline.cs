@@ -1,125 +1,84 @@
-﻿using System;
-using System.Collections.Generic;
+﻿using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
-using UnityEngine.Rendering.RenderGraphModule;
-using UnityEngine.Experimental.Rendering;
+using UnityEngine.Rendering.RendererUtils;
 
 public class ClusteredRenderPipeline : RenderPipeline
 {
     private ClusteredRenderPipelineAsset renderPipelineAsset;
 
-    private RenderGraph myRenderGraph;
+    private static readonly ShaderTagId unlitShaderTagId = new("ExampleLightModeTag");
+    private static readonly ShaderTagId forwardShaderTagId = new("UniversalForward");
 
     public ClusteredRenderPipeline(ClusteredRenderPipelineAsset asset)
     {
         renderPipelineAsset = asset;
-        myRenderGraph = new RenderGraph("ClusteredRenderGraph");
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        myRenderGraph?.Cleanup();
-        base.Dispose(disposing);
     }
 
     protected override void Render(ScriptableRenderContext context, List<Camera> cameras)
     {
-        foreach (var cam in cameras)
+        foreach (var camera in cameras)
         {
-            if (cam.enabled)
+            if (camera.enabled)
             {
-                RenderCamera(context, cam);
+                RenderCamera(context, camera);
             }
         }
-
     }
 
-    class PassData
+    void RenderCamera(ScriptableRenderContext context, Camera camera)
     {
-        public TextureHandle cameraTarget;
-        public Material material;
-        public Color clearColor;
-    }
+        // 컬링 파라미터 설정
+        if (!camera.TryGetCullingParameters(out ScriptableCullingParameters cullingParams))
+            return;
 
-    void RenderCamera(ScriptableRenderContext context, Camera cameraToRender)
-    {
-        context.SetupCameraProperties(cameraToRender);
-        var cmd = CommandBufferPool.Get("Example command buffer");
+        // 컬링 수행
+        CullingResults cullingResults = context.Cull(ref cullingParams);
 
-        RenderGraphParameters rgParams = new RenderGraphParameters
+        // 카메라 프로퍼티 설정 (VP 매트릭스 등)
+        context.SetupCameraProperties(camera);
+
+        // 커맨드 버퍼 생성
+        CommandBuffer cmd = CommandBufferPool.Get("Render Camera");
+
+        // 렌더 타겟 클리어
+        CameraClearFlags clearFlags = camera.clearFlags;
+        cmd.ClearRenderTarget(
+            clearFlags <= CameraClearFlags.Depth,
+            clearFlags <= CameraClearFlags.Color,
+            camera.backgroundColor
+        );
+
+        // 불투명 오브젝트 렌더링
+        var opaqueRendererListDesc = new RendererListDesc(unlitShaderTagId, cullingResults, camera)
         {
-            commandBuffer = cmd,
-            scriptableRenderContext = context,
-            currentFrameIndex = Time.frameCount,
+            sortingCriteria = SortingCriteria.CommonOpaque,
+            renderQueueRange = RenderQueueRange.opaque
         };
+        RendererList opaqueRendererList = context.CreateRendererList(opaqueRendererListDesc);
+        cmd.DrawRendererList(opaqueRendererList);
 
-        try
+        // 스카이박스 렌더링
+        if (camera.clearFlags == CameraClearFlags.Skybox && RenderSettings.skybox != null)
         {
-            myRenderGraph.BeginRecording(rgParams);
-            using (var builder = myRenderGraph.AddRasterRenderPass<PassData>("Example render pass", out var passData))
-            {
-
-                RenderTargetInfo cameraTargetProperties = new RenderTargetInfo
-                {
-                    width = cameraToRender.pixelWidth,
-                    height = cameraToRender.pixelHeight,
-                    volumeDepth = 1,
-                    msaaSamples = 1,
-                    format = GraphicsFormat.R8G8B8A8_UNorm
-                };
-                passData.cameraTarget = myRenderGraph.ImportBackbuffer(BuiltinRenderTextureType.CameraTarget, cameraTargetProperties);
-
-                passData.material = new Material(Shader.Find("Examples/SimpleUnlitColor"));
-                passData.clearColor = cameraToRender.backgroundColor;
-
-                builder.SetRenderAttachment(passData.cameraTarget, 0, AccessFlags.Write);
-
-                // Make sure the render graph system keeps the render pass, even if it's not used in the final frame.
-                // Don't use this in production code, because it prevents the render graph system from removing the render pass if it's not needed.
-                builder.AllowPassCulling(false);
-
-                builder.SetRenderFunc(static (PassData passData, RasterGraphContext context) =>
-                {
-                    // Create a quad mesh
-                    Mesh mesh = new Mesh();
-
-                    Vector3[] vertices = new Vector3[4]
-                    {
-                        new Vector3(0, 0, 0),
-                        new Vector3(1f, 0, 0),
-                        new Vector3(0, 1f, 0),
-                        new Vector3(1f, 1f, 0)
-                    };
-                    mesh.vertices = vertices;
-
-                    int[] triangles = new int[6]
-                    {
-                        0, 2, 1,
-                        2, 3, 1
-                    };
-                    mesh.triangles = triangles;
-
-                    context.cmd.ClearRenderTarget(true, true, passData.clearColor);
-
-                    // Create a transformation matrix for the quad
-                    Matrix4x4 trs = Matrix4x4.TRS(Vector3.zero, Quaternion.Euler(0, 0, 0), Vector3.one);
-
-                    // Draw the quad onto the camera target, using the shader and the source texture
-                    context.cmd.DrawMesh(mesh, trs, passData.material, 0);
-                });
-            }
-
-            myRenderGraph.EndRecordingAndExecute();
-        }
-        catch (Exception e)
-        {
-            if (myRenderGraph.ResetGraphAndLogException(e))
-                throw;
+            RendererList skyboxRendererList = context.CreateSkyboxRendererList(camera);
+            cmd.DrawRendererList(skyboxRendererList);
         }
 
+        // 투명 오브젝트 렌더링
+        var transparentRendererListDesc = new RendererListDesc(unlitShaderTagId, cullingResults, camera)
+        {
+            sortingCriteria = SortingCriteria.CommonTransparent,
+            renderQueueRange = RenderQueueRange.transparent
+        };
+        RendererList transparentRendererList = context.CreateRendererList(transparentRendererListDesc);
+        cmd.DrawRendererList(transparentRendererList);
+
+        // 커맨드 버퍼 실행 및 정리
         context.ExecuteCommandBuffer(cmd);
         CommandBufferPool.Release(cmd);
+
+        // 프레임 제출
         context.Submit();
     }
 }
